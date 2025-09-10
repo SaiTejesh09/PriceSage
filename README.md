@@ -18,9 +18,11 @@ With automation, PriceSage can **run multiple times a day**, updating the CSV on
 
 ---
 
-## Installation
+
+## Installation 
 
 1. Clone the repository:
+
 
 ```bash
 git clone https://github.com/SaiTejesh09/PriceSage.git
