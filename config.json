@@ -1,0 +1,22 @@
+{
+  "scheduler": {
+    "runs_per_day": 6,
+    "times": [
+      "00:00",
+      "04:00",
+      "08:00",
+      "12:00",
+      "16:00",
+      "20:00"
+    ],
+    "timezone": "Asia/Kolkata",
+    "immediate_run": true
+  },
+  "notifications": {
+    "price_change_threshold": 0.0,
+    "only_price_drop": false
+  },
+  "storage": {
+    "database_path": "data/prices.db"
+  }
+}

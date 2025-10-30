@@ -1,133 +1,153 @@
-# scraper.py
-import time
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime
 from typing import Optional
+
 import requests
-from requests.adapters import HTTPAdapter
-try:
-    # urllib3 >=1.26 style import
-    from urllib3.util.retry import Retry
-except Exception:  # pragma: no cover
-    from requests.packages.urllib3.util.retry import Retry  # fallback
 from bs4 import BeautifulSoup
-import pandas as pd
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from models import ScrapeResult
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/128.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US, en;q=0.5",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.amazon.in/",
 }
 
-def build_session(headers: Optional[dict] = None) -> requests.Session:
-    s = requests.Session()
-    s.headers.update(headers or DEFAULT_HEADERS)
-    # Configure retries with backoff and Retry-After
-    retry_kwargs = dict(
-        total=3,
-        backoff_factor=1.0,  # 1, 2, 4 seconds
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "HEAD"]),
-    )
-    try:
-        retry = Retry(**retry_kwargs, respect_retry_after_header=True)
-    except TypeError:
-        retry = Retry(**retry_kwargs)
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
+PRICE_PATTERNS = [
+    {"id": "priceblock_dealprice"},
+    {"id": "priceblock_saleprice"},
+    {"id": "priceblock_ourprice"},
+    {"css": "span.a-price span.a-offscreen"},
+    {"css": "span.a-price-whole"},
+]
 
-def _extract_title(container: BeautifulSoup) -> Optional[str]:
-    # Primary: your original path
-    t = None
-    title_div = container.find("div", {"data-cy": "title-recipe"})
-    if title_div:
-        a = title_div.find("a")
-        if a:
-            h2 = a.find("h2")
-            if h2:
-                span = h2.find("span")
-                if span and span.text:
-                    t = span.text.strip()
-    # Fallback: generic h2 > a > span
-    if not t:
-        span = container.select_one("h2 a span")
-        if span and span.text:
-            t = span.text.strip()
-    # Last resort: any h2 text
-    if not t:
-        h2 = container.find("h2")
-        if h2 and h2.text:
-            t = h2.get_text(strip=True)
-    return t
+CURRENCY_MAP = {
+    "₹": "INR",
+    "Rs": "INR",
+    "$": "USD",
+    "£": "GBP",
+    "€": "EUR",
+}
 
-def scrape_page(url: str, session: Optional[requests.Session] = None) -> Optional[pd.DataFrame]:
-    s = session or build_session()
-    try:
-        # Use explicit timeouts (connect, read)
-        resp = s.get(url, timeout=(10, 30))
-    except Exception as e:
-        print(f"Request error for {url}: {e}")
+PRICE_REGEX = re.compile(r"(\d[\d,.]*)")
+
+
+class AmazonScraper:
+    def __init__(
+        self,
+        headers: Optional[dict] = None,
+        connect_timeout: float = 10.0,
+        read_timeout: float = 30.0,
+    ) -> None:
+        self.session = self._build_session(headers or DEFAULT_HEADERS)
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+
+    def _build_session(self, headers: dict) -> requests.Session:
+        session = requests.Session()
+        session.headers.update(headers)
+        retry = Retry(
+            total=3,
+            backoff_factor=1.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET", "HEAD"]),
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def fetch_product(self, name: str, url: str) -> ScrapeResult:
+        LOGGER.info("Fetching %s", name)
+        try:
+            response = self.session.get(
+                url, timeout=(self._connect_timeout, self._read_timeout)
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Request failed for {name}: {exc}") from exc
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Unexpected status {response.status_code} for {name}: {url}"
+            )
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        title = self._extract_title(soup)
+        availability = self._extract_availability(soup)
+        price_text = self._extract_price_text(soup)
+        price = self._parse_price(price_text)
+        currency = self._detect_currency(price_text, soup)
+
+        return ScrapeResult(
+            product_name=name,
+            product_url=url,
+            price=price,
+            currency=currency,
+            title=title,
+            availability=availability,
+            fetched_at=datetime.utcnow(),
+            raw_price=price_text,
+        )
+
+    def _extract_title(self, soup: BeautifulSoup) -> Optional[str]:
+        node = soup.select_one("#productTitle")
+        if node:
+            return node.get_text(strip=True)
+        node = soup.select_one("span#title")
+        return node.get_text(strip=True) if node else None
+
+    def _extract_price_text(self, soup: BeautifulSoup) -> Optional[str]:
+        for pattern in PRICE_PATTERNS:
+            if "id" in pattern:
+                node = soup.find(id=pattern["id"])
+            else:
+                node = soup.select_one(pattern["css"])
+            if node and node.get_text(strip=True):
+                return node.get_text(strip=True)
         return None
 
-    if resp.status_code != 200:
-        print(f"Skipping {url} due to status code: {resp.status_code}")
-        # If the server told us when to retry, wait politely once
-        ra = resp.headers.get("Retry-After")
-        if ra and ra.isdigit():
-            wait = max(1, int(ra))
-            print(f"Retry-After header present; sleeping {wait}s before continuing batch")
-            time.sleep(wait)
+    def _parse_price(self, price_text: Optional[str]) -> Optional[float]:
+        if not price_text:
+            return None
+        cleaned = price_text.replace("\xa0", " ")
+        match = PRICE_REGEX.search(cleaned)
+        if not match:
+            return None
+        candidate = match.group(1).replace(",", "")
+        try:
+            return float(candidate)
+        except ValueError:
+            LOGGER.debug("Unable to convert price '%s'", candidate)
+            return None
+
+    def _detect_currency(
+        self, price_text: Optional[str], soup: BeautifulSoup
+    ) -> Optional[str]:
+        if price_text:
+            for symbol, code in CURRENCY_MAP.items():
+                if symbol in price_text:
+                    return code
+        symbol_node = soup.select_one("span.a-price-symbol")
+        if symbol_node:
+            symbol = symbol_node.get_text(strip=True)
+            for key, code in CURRENCY_MAP.items():
+                if key in symbol:
+                    return code
         return None
 
-    soup = BeautifulSoup(resp.content, "html.parser")
-    titles, prices, ratings, review_counts, sources = [], [], [], [], []
-
-    product_containers = soup.find_all(
-        "div", attrs={"data-asin": True, "data-component-type": "s-search-result"}
-    )
-
-    for c in product_containers:
-        # Title with fallbacks
-        title = _extract_title(c)
-        titles.append(title if title else None)
-
-        # Price: prefer a-price-whole, fallback to offscreen
-        price = None
-        p1 = c.find("span", class_="a-price-whole")
-        if p1 and p1.text:
-            price = p1.text.strip()
-        if not price:
-            p2 = c.select_one(".a-price .a-offscreen")
-            if p2 and p2.text:
-                price = p2.text.strip()
-        prices.append(price if price else None)
-
-        # Rating (e.g., "4.2 out of 5 stars")
-        rating = None
-        r1 = c.find("span", class_="a-icon-alt")
-        if r1 and r1.text:
-            rating = r1.text.strip()
-        ratings.append(rating if rating else None)
-        rc = None
-        rc1 = c.find("span", class_="a-size-base s-underline-text")
-        if rc1 and rc1.text:
-            rc = rc1.text.strip()
-        reviews = rc if rc else None
-        review_counts.append(reviews)
-        sources.append(url)
-
-    if not titles and not prices and not ratings and not review_counts:
+    def _extract_availability(self, soup: BeautifulSoup) -> Optional[str]:
+        node = soup.select_one("#availability span")
+        if node and node.get_text(strip=True):
+            return node.get_text(strip=True)
         return None
-
-    df = pd.DataFrame(
-        {
-            "Title": titles,
-            "Price (₹)": prices,
-            "Rating": ratings,
-            "Review Count": review_counts,
-            "source_url": sources,
-        }
-    )
-    return df
